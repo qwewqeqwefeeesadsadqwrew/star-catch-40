@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>接住星星 · 40 关</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  html, body { margin: 0; height: 100%; background: #070a12; color: #e8eaf0;
+    font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; overflow: hidden; }
+  #wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; }
+  #hud { display: flex; gap: 22px; margin-bottom: 8px; font-size: 14px; letter-spacing: .5px; }
+  #hud b { color: #ffd166; }
+  canvas { background: #0f1420; border-radius: 14px; box-shadow: 0 12px 44px rgba(0,0,0,.55); touch-action: none; }
+  #panel { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(6,8,14,.76); z-index: 40; }
+  #panel.on { display: flex; }
+  .card { background: #1b2233; border: 1px solid #31405c; border-radius: 16px; padding: 26px 34px;
+    text-align: center; min-width: 280px; }
+  .card h2 { margin: 0 0 6px; font-size: 22px; }
+  .card p { margin: 6px 0 18px; color: #93a0bb; font-size: 14px; }
+  button { font: inherit; font-size: 17px; padding: 10px 26px; border: 0; border-radius: 10px;
+    background: #ffb703; color: #1b1300; font-weight: 600; cursor: pointer; }
+  button:active { transform: scale(.97); }
+  #toast { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.62);
+    padding: 6px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .25s; z-index: 60; }
+  #loading { position: fixed; inset: 0; display: none; flex-direction: column; align-items: center;
+    justify-content: center; background: rgba(6,8,14,.9); z-index: 50; }
+  #loading.on { display: flex; }
+  .spin { width: 44px; height: 44px; border: 4px solid #2b3650; border-top-color: #ffb703;
+    border-radius: 50%; animation: sp 1s linear infinite; margin-bottom: 14px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #loadtxt { color: #93a0bb; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <span>关卡 <b id="lv">1</b>/40</span>
+    <span>接到 <b id="ct">0</b></span>
+    <span>目标 <b id="tg">12</b></span>
+  </div>
+  <canvas id="cv" width="420" height="640"></canvas>
+</div>
+<div id="panel"><div class="card">
+  <h2 id="pt"></h2><p id="ps"></p><button id="pb">下一关</button>
+</div></div>
+<div id="loading"><div class="spin"></div><div id="loadtxt">加载中…</div></div>
+<div id="toast"></div>
+<script>
+(function () {
+  'use strict';
+  var W = 420, H = 640;
+  var MAX_LEVEL = 40;
+  var NOPRELOAD = /[?&]nopreload=1/.test(location.search);
+  var MANUAL = /[?&]manual=1/.test(location.search);
+
+  var level = 0;                    // 0-based
+  var caught = 0, target = 12, score = 0;
+  var phase = 'loading';
+  var cfg = { target: 12, fallSpeed: 100, spawnMs: 1200 };
+  var stars = [], basketX = W / 2, basketTarget = W / 2;
+  var basketW = 84, basketH = 16, basketY = H - 72;
+  var lastFrame = 0, lastSpawn = 0, raf = null;
+  var levelData = {}, loading = false, lastLoadMs = null, lastLoadSource = null;
+  var preloadTimer = null, transitions = [];
+  var runLog = [];
+  function rlog(o) { o.t = Math.round(performance.now()); runLog.push(o); if (runLog.length > 200) runLog.shift(); }
+  var autoMode = !MANUAL;           // 默认页内自播（公网链接打开就自己玩）
+
+  var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  var panel = document.getElementById('panel'), toastEl = document.getElementById('toast');
+  var loadingEl = document.getElementById('loading'), loadTxt = document.getElementById('loadtxt');
+
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  function toast(msg) {
+    toastEl.textContent = msg; toastEl.style.opacity = 1;
+    setTimeout(function () { toastEl.style.opacity = 0; }, 1300);
+  }
+  function showLoading(t) { loading = true; loadTxt.textContent = t || '加载中…'; loadingEl.classList.add('on'); }
+  function hideLoading() { loading = false; loadingEl.classList.remove('on'); }
+
+  // ---------- 关卡资源（模拟真实游戏的 bundle） ----------
+  function fetchLevel(n) {
+    var t0 = performance.now();
+    return fetch('levels/level-' + n + '.json?ts=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) { d.__fetchMs = Math.round(performance.now() - t0); return d; });
+  }
+  function ensureLevel(n, sourceHint) {
+    if (levelData[n]) { lastLoadMs = 0; lastLoadSource = sourceHint || 'preload'; return Promise.resolve(levelData[n]); }
+    showLoading('加载第 ' + n + ' 关…');
+    var t0 = performance.now();
+    return fetchLevel(n).then(function (d) {
+      levelData[n] = d;
+      lastLoadMs = Math.round(performance.now() - t0);
+      lastLoadSource = sourceHint || 'network';
+      hideLoading();
+      return d;
+    }).catch(function (e) { hideLoading(); throw e; });
+  }
+  function schedulePreload() {
+    if (NOPRELOAD) return;
+    if (preloadTimer) { clearTimeout(preloadTimer); preloadTimer = null; }
+    var next = level + 2;
+    if (next > MAX_LEVEL || levelData[next]) return;
+    preloadTimer = setTimeout(function () {
+      preloadTimer = null;
+      fetchLevel(next).then(function (d) { levelData[next] = d; }).catch(function () { /* 预载失败不影响当前关 */ });
+    }, 1000 + Math.random() * 1000);
+  }
+
+  function initLevel(n) {
+    var d = levelData[n];
+    cfg = d;
+    target = d.target;
+    level = n - 1;
+    caught = 0; score = 0;
+    stars = [];
+    basketX = W / 2; basketTarget = W / 2;
+    phase = 'playing';
+    panel.classList.remove('on');
+    rlog({ kind: 'level-start', level: n, target: target });
+    hud(); startLoop(); schedulePreload();
+  }
+
+  function hud() {
+    document.getElementById('lv').textContent = level + 1;
+    document.getElementById('ct').textContent = caught;
+    document.getElementById('tg').textContent = target;
+  }
+
+  // ---------- 游戏循环 ----------
+  function startLoop() {
+    if (raf) cancelAnimationFrame(raf);
+    lastFrame = performance.now();
+    lastSpawn = lastFrame;
+    raf = requestAnimationFrame(tick);
+  }
+
+  function spawnStar() {
+    var r = 13;
+    stars.push({ x: rnd(r + 10, W - r - 10), y: -r, r: r, vy: cfg.fallSpeed * rnd(0.92, 1.08) });
+    if (stars.length > 40) stars.shift();   // 防御：数组不涨
+  }
+
+  function tick(now) {
+    if (phase !== 'playing') { raf = null; return; }
+    var dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+
+    if (now - lastSpawn >= cfg.spawnMs) { spawnStar(); lastSpawn = now; }
+
+    for (var i = 0; i < stars.length; i++) stars[i].y += stars[i].vy * dt;
+
+    // 接住判定（游戏自己的判定）
+    for (i = stars.length - 1; i >= 0; i--) {
+      var s = stars[i];
+      var reachY = s.y + s.r >= basketY && s.y - s.r <= basketY + basketH;
+      var reachX = Math.abs(s.x - basketX) <= basketW / 2 + s.r * 0.4;
+      if (reachY && reachX) {
+        stars.splice(i, 1); caught++; score += 10; hud();
+        if (caught >= target) { winLevel(); return; }
+      } else if (s.y - s.r > H + 40) {
+        stars.splice(i, 1);   // 漏接：正常移除，不惩罚（无失败态）
+      }
+    }
+
+    // 篮子平滑跟随（游戏自己的动画）
+    basketX += (basketTarget - basketX) * Math.min(1, dt * 14);
+    if (basketX < basketW / 2) basketX = basketW / 2;
+    if (basketX > W - basketW / 2) basketX = W - basketW / 2;
+
+    draw();
+    raf = requestAnimationFrame(tick);
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    // 星星
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      ctx.fillStyle = '#ffd166';
+      star(s.x, s.y, 5, s.r, s.r * 0.45);
+      ctx.fill();
+    }
+    // 篮子
+    ctx.fillStyle = '#4fa3ff';
+    roundRect(basketX - basketW / 2, basketY, basketW, basketH, 8);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.18)';
+    roundRect(basketX - basketW / 2 + 6, basketY + 3, basketW - 12, 4, 2);
+    ctx.fill();
+  }
+
+  function star(cx, cy, n, outer, inner) {
+    ctx.beginPath();
+    for (var i = 0; i < n * 2; i++) {
+      var r = i % 2 === 0 ? outer : inner;
+      var a = -Math.PI / 2 + i * Math.PI / n;
+      var x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // ---------- 输入（游戏自己的接口：指针位置 = 篮子目标） ----------
+  function pointerToTarget(e) {
+    var rect = cv.getBoundingClientRect();
+    var x = (e.clientX - rect.left) * (W / rect.width);
+    basketTarget = x;
+  }
+  cv.addEventListener('pointermove', pointerToTarget);
+  cv.addEventListener('pointerdown', pointerToTarget);
+  cv.addEventListener('touchmove', function (e) { if (e.touches[0]) pointerToTarget(e.touches[0]); e.preventDefault(); }, { passive: false });
+
+  // ---------- 页内自播（公网链接打开就自己玩；?manual=1 关闭） ----------
+  function autoPilot() {
+    if (!autoMode || phase !== 'playing' || loading) return;
+    var best = null, bestT = Infinity;
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      var t = (basketY - s.y) / s.vy;
+      if (t >= 0 && t < bestT) { bestT = t; best = s; }
+    }
+    if (best) basketTarget = best.x + rnd(-1.5, 1.5);   // 拟人微抖，不精确到像素
+  }
+  setInterval(autoPilot, 70);
+
+  // ---------- 结算 / 切关 ----------
+  function winLevel() {
+    phase = 'settle';
+    rlog({ kind: 'level-done', level: level + 1, caught: caught, target: target });
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    var last = level === MAX_LEVEL - 1;
+    document.getElementById('pt').textContent = last ? '全部通关！' : '第 ' + (level + 1) + ' 关完成';
+    document.getElementById('ps').textContent = '接到 ' + caught + ' / 目标 ' + target + (last ? ' · 40 关全部完成' : '');
+    document.getElementById('pb').textContent = last ? '再来一轮' : '下一关';
+    document.getElementById('pb').onclick = function () { if (last) location.reload(); else goNext(); };
+    panel.classList.add('on');
+  }
+
+  function goNext() {
+    var n1 = level + 2;
+    if (n1 > MAX_LEVEL) return;
+    var had = !!levelData[n1];
+    var t0 = performance.now();
+    panel.classList.remove('on');
+    ensureLevel(n1, had ? 'preload' : 'network').then(function () {
+      initLevel(n1);
+      var tr = { kind: 'transition', from: level, to: n1, wallMs: Math.round(performance.now() - t0), loadMs: lastLoadMs, source: lastLoadSource };
+      transitions.push(tr); rlog(tr);
+      if (transitions.length > 60) transitions.shift();
+    }).catch(function () {
+      document.getElementById('pt').textContent = '加载失败';
+      document.getElementById('ps').textContent = '再点一次重试';
+      document.getElementById('pb').textContent = '重试';
+      panel.classList.add('on');
+    });
+  }
+
+  // 自播节奏：结算后停 1~3 秒再点「下一关」（human 档）
+  setInterval(function () {
+    if (!autoMode || phase !== 'settle' || !panel.classList.contains('on')) return;
+    if (document.getElementById('pb').textContent === '再来一轮') return;
+    if (window.__autoNextPending) return;
+    window.__autoNextPending = true;
+    var wait = 1000 + Math.random() * 2000;
+    rlog({ kind: 'settle-wait', level: level + 1, waitMs: Math.round(wait) });
+    setTimeout(function () {
+      window.__autoNextPending = false;
+      if (phase === 'settle' && panel.classList.contains('on')) document.getElementById('pb').click();
+    }, wait);
+  }, 200);
+
+  // ---------- 只读状态 + 自播契约（verify-online 用） ----------
+  window.__AUTOPLAY = autoMode;
+  window.__auto = {
+    pull: function () {
+      return {
+        level: level + 1, caught: caught, target: target, phase: phase,
+        stars: stars.length, loadMs: lastLoadMs, source: lastLoadSource,
+        preloaded: Object.keys(levelData).map(Number).length
+      };
+    },
+    get over() { return phase === 'settle' ? 'settle' : null; }
+  };
+  window.__runLog = runLog;
+  window.__game = {
+    snap: function () {
+      return {
+        level: level + 1, caught: caught, target: target, phase: phase, loading: loading,
+        stars: stars.length, basketX: Math.round(basketX), basketTarget: Math.round(basketTarget),
+        panelOn: panel.classList.contains('on'), btnText: document.getElementById('pb').textContent,
+        preloaded: Object.keys(levelData).map(Number).sort(function (a, b) { return a - b; }),
+        lastLoadMs: lastLoadMs, lastLoadSource: lastLoadSource,
+        nopreload: NOPRELOAD, autoMode: autoMode,
+        transitions: transitions.slice(),
+        at: performance.now()
+      };
+    }
+  };
+
+  // 启动：先加载第 1 关
+  showLoading('加载第 1 关…');
+  ensureLevel(1, 'network').then(function () { initLevel(1); }).catch(function (e) {
+    loadTxt.textContent = '第 1 关加载失败：' + e.message;
+  });
+})();
+</script>
+</body>
+</html>
